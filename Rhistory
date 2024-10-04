@@ -1,0 +1,160 @@
+150 * 5
+20 + (150*5) + 1000 + 150 + (60*5)
+20 + (150*5) + 1000 + 150 + (60*6)
+(15047.23)*1.1*1.1
+(15047.23)*1.11
+1.1*1.1
+(15047.23)*1.21
+1.1^4
+1.1 * 1.1 * 1.1*1.1
+27572 * 1.464
+80 + 1000 + 500 + (60*5)
+80 + 1000 + 500 + (60*6)
+1000 + (180*5) + (60*5)
+
+# Load packages
+library(unmarked)
+library(dplyr)
+library(ggplot2)
+library(sf)
+#library(tmap)
+library(tidyr)
+#library(stars)
+#library(dichromat)
+# dropbox folder
+setwd("C:/Users/roryj/Dropbox/Research/arbo_occupancy/")
+
+# Load shapefile (n.b. set ADMcode of shp to numeric to facilitate aligning with other datasets)
+shapefile_path <- "usa_counties.shp"
+shp <- st_read(shapefile_path) %>%
+dplyr::mutate(ADMcode = as.numeric(ADMcode)) %>%
+dplyr::filter(!STATEFP %in% c("02", "15")) # remove alaska and hawaii
+# Load ArboNET data for WNV cases
+arbonet_data_path <- "spillovers_arbonet.csv"
+arbonet_data <- read.csv(arbonet_data_path)
+# Display structure of ArboNET data to verify columns
+str(arbonet_data)
+# Create full data frame with all years and locations in entire USA
+data_full <- expand.grid(unique(shp$ADMcode), 2004:2020) %>%
+as.data.frame() %>%
+rename("ADMcode" = 1, "Year" = 2) %>%
+left_join(
+arbonet_data %>%
+# RG: needed to subset to include "ALL CASES" otherwise 3 observations per year-county (neuro, non-neuro, all)
+filter(Disease == "Eastern equine encephalitis" & Presentation == "All cases") %>%
+select(ADMcode, Year, NumCases),
+by = c("ADMcode", "Year")
+) %>%
+mutate(NumCases = replace(NumCases, is.na(NumCases), 0), # Set NAs to zero
+Present = ifelse(NumCases > 0, 1, 0)) # Create presence-absence column
+# # Load covariate data for population density, healthcare access, stagnant water proximity, and precipitation
+#
+# # Load population density data
+# population_density <- read.csv("/Users/torrelavelle/Downloads/population_density.csv")
+# population_density <- population_density %>%
+#   rename(ADMcode = county_code) %>%
+#   select(ADMcode, year, pop_density)
+#
+# # Load healthcare access data (insurance coverage)
+# insurance_coverage <- read.csv("/Users/torrelavelle/Downloads/productDownload_2024-10-04T072552/combined_uninsured_data_2010_2023.csv")
+# insurance_coverage <- insurance_coverage %>%
+#   rename(ADMcode = county_code) %>%
+#   select(ADMcode, year, insurance_coverage)
+#
+# # Load proximity to stagnant water data
+# stagnant_water_proximity <- read.csv("/Users/torrelavelle/downloads/stagnant_water_proximity.csv")
+# stagnant_water_proximity <- stagnant_water_proximity %>%
+#   rename(ADMcode = county_code) %>%
+#   select(ADMcode, year, proximity_index)
+#
+# # Load precipitation data
+# precipitation_data <- read.csv("combined_precipitation_by_county.csv")
+# precipitation_data <- precipitation_data %>%
+#   rename(ADMcode = county_code) %>%
+#   select(ADMcode, year, total_precipitation)
+#
+# # Merge all covariates with main dataset
+# covariate_data <- full_join(data_full, population_density, by = c("ADMcode", "Year")) %>%
+#   full_join(insurance_coverage, by = c("ADMcode", "Year")) %>%
+#   full_join(stagnant_water_proximity, by = c("ADMcode", "Year")) %>%
+#   full_join(precipitation_data, by = c("ADMcode", "Year"))
+# load covariate data from fingerprint as a test (urban, health travel time, evi dissimilarity, tmean, precip)
+covars = read.csv("usa_admin2_covars.csv") %>%
+dplyr::mutate(
+st = unlist(lapply(strsplit(ADMcode, "_"), "[", 1)),
+ct =  sprintf("%03d", as.numeric(as.vector(unlist(lapply(strsplit(ADMcode, "_"), "[", 2))))),
+ADMcode = as.numeric(paste(st, ct, sep=""))
+) %>%
+dplyr::select(ADMcode, health_travel, evi_dissimilarity, tmean, precip, urban_cover, forest_cover) %>%
+dplyr::mutate(health_travel_log = log(health_travel))
+# Subset data for East USA (model runs fast) and add covars
+ca_az_shp <- shp %>%
+#filter(STATE_NAME %in% c("California", "Arizona"))
+dplyr::filter(ADMcode %in% covars$ADMcode) %>%
+filter(!STATEFP %in% c("06", "04", # cali and ariz
+"32", "41", "49", "16",
+"35", "53", "08", "56", "30",
+"38", "46", "31", "20", "40", "48",
+"27", "29", "05", "19", "55", "17")) %>% # shapefile loaded above didn't have STATENAME so used FIPS codes
+dplyr::left_join(covars) %>% # combine with covariates
+dplyr::filter(ADMcode != 25019)
+# Filter disease data to same subset of states
+ca_az_data <- data_full %>%
+filter(ADMcode %in% ca_az_shp$ADMcode)
+# ------------ setup for modelling -------------
+# Create detection history matrix
+detection_history <- ca_az_data %>%
+dplyr::select(-NumCases) %>% # need to remove "NumCases" column at this point so we make a matrix out of a 3-column dataframe
+tidyr::pivot_wider(names_from = "Year", values_from = "Present") # RG: used tidyr instead of spread as documentation suggested more up-to-date
+# create observation level covariate for log num cases per year
+# this is mainly as a test; I didn't use in test models below as
+numcase_history <- ca_az_data %>%
+dplyr::mutate(NumCases = log(NumCases+1)) %>%
+dplyr::select(-Present) %>%
+tidyr::pivot_wider(names_from = "Year", values_from = "NumCases") # RG: used tidyr instead of spread as documentation suggested more up-to-date
+# Ensure detection history order matches site covariates
+detection_history <- detection_history[ order(detection_history$ADMcode), ]
+numcase_history <- numcase_history[ order(numcase_history$ADMcode), ]
+ca_az_shp <- ca_az_shp[ order(ca_az_shp$ADMcode), ]
+# check all matching orders - correct
+all(detection_history$ADMcode == numcase_history$ADMcode)
+all(detection_history$ADMcode == ca_az_shp$ADMcode)
+# Create unmarked frame for occupancy modeling
+detection_matrix <- as.matrix(detection_history[, -1])  # Removing ADMcode column
+umf <- unmarkedFrameOccu(
+# detection matrix
+y = detection_matrix,
+# covariates at site level (time invariant)
+siteCovs = ca_az_shp %>%
+sf::st_drop_geometry() %>%
+dplyr::select(ADMcode, health_travel_log, evi_dissimilarity, tmean, precip, urban_cover, forest_cover) %>%
+dplyr::mutate(health_travel_log = scale(health_travel_log),
+evi_dissimilarity = scale(evi_dissimilarity),
+tmean = scale(tmean),
+precip = scale(precip),
+urban_cover = scale(urban_cover),
+forest_cover = scale(forest_cover)),
+# matrix of covariates at observation level (time variant)
+obsCovs = list(logCases = numcase_history[, -1])
+)
+# ------------- fit occupancy models -------------
+# as an example, compare occupancy model specifications to see if urban functions mainly as a detection vs an occupancy driver
+# compare models:
+# fm_null = no covariates
+# fm1 = urban as an occupancy driver
+# fm2 = urban as detection driver
+# fm3 = urban as both occupancy and detection driver
+fm_null <- occu(~ 1 ~ 1 + (1|ADMcode),  data = umf)
+summary(fm_null)
+fm1 <- occu(~ 1 ~ precip + urban_cover + forest_cover + (1|ADMcode),  data = umf)
+fm2 <- occu(~ urban_cover ~ precip + forest_cover + (1|ADMcode),  data = umf)
+fm3 <- occu(~ 1 ~ precip + forest_cover + (1|ADMcode),  data = umf)
+# compare models using AIC
+# can see that including urban as a detection driver yields much greater improvement than with urban as occupancy driver
+# if we add urban as occupancy AND detection driver, it's a slightly better model, but relatively marginal improvement
+# n.b. this model does not include spatial structure so effects are definitely subject to change
+fl <- fitList(null=fm_null, fm1=fm1, fm2=fm2, fm3=fm3)
+modSel(fl)
+# Summary of best fitted model
+summary(fm2)
+exp(-0.2207)
