@@ -11,7 +11,7 @@ library(tidyr)
 library(readr)
 library(viridis)
 library(patchwork)
-library(biscale)  # Added based on bivariate mapping reference
+library(biscale)
 
 population_density <- read_csv("/Users/torrelavelle/Dropbox/cleaned_population_density_data.csv", show_col_types = FALSE) %>%
   rename(ADMcode = CountyFIPS) %>%
