@@ -1,5 +1,7 @@
 # Figure 4
 
+install.packages("biscale")
+
 # Load libraries
 library(unmarked)
 library(dplyr)
@@ -8,8 +10,9 @@ library(sf)
 library(tidyr)
 library(readr)
 library(viridis)
+library(patchwork)
+library(biscale)  # Added based on bivariate mapping reference
 
-# Load covariate data
 population_density <- read_csv("/Users/torrelavelle/Dropbox/cleaned_population_density_data.csv", show_col_types = FALSE) %>%
   rename(ADMcode = CountyFIPS) %>%
   mutate(ADMcode = as.numeric(ADMcode))
@@ -32,11 +35,11 @@ shp <- st_read(shapefile_path) %>%
   mutate(ADMcode = as.numeric(ADMcode)) %>%
   filter(!STATEFP %in% c("02", "15"))
 
-arbonet_data <- read.csv("/Users/torrelavelle/Dropbox/arbo_occupancy/spillovers_arbonet.csv")
+arbonet_data <- read_csv("/Users/torrelavelle/Dropbox/arbo_occupancy/spillovers_arbonet.csv") %>%
+  mutate(ADMcode = as.numeric(ADMcode))
 
-# Create full dataset
-full_data <- expand.grid(unique(shp$ADMcode), 2004:2020) %>%
-  rename(ADMcode = Var1, Year = Var2) %>%
+# Create dataset
+full_data <- expand.grid(ADMcode = unique(shp$ADMcode), Year = 2004:2020) %>%
   left_join(arbonet_data %>% filter(Disease == "West Nile virus disease", Presentation == "All cases") %>% select(ADMcode, Year, NumCases),
             by = c("ADMcode", "Year")) %>%
   mutate(NumCases = replace_na(NumCases, 0),
@@ -49,62 +52,86 @@ covariate_data <- full_data %>%
   left_join(stagnant_water_proximity, by = c("ADMcode", "Year")) %>%
   left_join(precipitation_data, by = c("ADMcode", "Year"))
 
-heatmap_detection <- ggplot(covariate_data) +
-  geom_tile(aes(x = Year, y = factor(ADMcode), fill = factor(Present))) +
-  theme_classic() +
-  scale_fill_viridis_d(name = "Detection") +
-  ggtitle("WNV Detection Heatmap")
-print(heatmap_detection)
+site_covs <- covariate_data %>%
+  group_by(ADMcode) %>%
+  summarise(PopDensity = mean(PopulationDensity, na.rm = TRUE),
+            Insurance = mean(InsuranceCoverage, na.rm = TRUE),
+            Water = mean(WaterBodyProximity, na.rm = TRUE),
+            Precip = mean(TotalAnnualPrecipitation, na.rm = TRUE),
+            .groups = 'drop') %>%
+  mutate(across(-ADMcode, scale))
 
-heatmap_cases <- ggplot(covariate_data) +
-  geom_tile(aes(x = Year, y = factor(ADMcode), fill = log(NumCases + 1))) +
-  theme_classic() +
-  scale_fill_viridis_c(name = "Log(Cases + 1)") +
-  ggtitle("WNV Case Heatmap")
-print(heatmap_cases)
+covariate_data <- covariate_data %>% mutate(logCases = log(NumCases + 1))
+
+covariate_data <- covariate_data %>%
+  group_by(ADMcode, Year) %>%
+  summarise(Present = max(Present, na.rm = TRUE),
+            logCases = max(logCases, na.rm = TRUE),
+            .groups = 'drop')
 
 detection_history <- covariate_data %>%
-  select(-NumCases) %>%
-  pivot_wider(names_from = "Year", values_from = "Present")
+  pivot_wider(names_from = "Year", values_from = "Present", values_fill = 0)
 
 numcase_history <- covariate_data %>%
-  mutate(NumCases = log(NumCases + 1)) %>%
-  select(-Present) %>%
-  pivot_wider(names_from = "Year", values_from = "NumCases")
+  pivot_wider(names_from = "Year", values_from = "logCases", values_fill = 0)
 
 detection_history <- detection_history[order(detection_history$ADMcode), ]
 numcase_history <- numcase_history[order(numcase_history$ADMcode), ]
 shp <- shp[order(shp$ADMcode), ]
 
-detection_matrix <- as.matrix(detection_history[, -1])
-site_covs <- covariate_data %>% 
-  group_by(ADMcode) %>% 
-  summarise(PopDensity = mean(PopulationDensity, na.rm = TRUE),
-            Insurance = mean(InsuranceCoverage, na.rm = TRUE),
-            Water = mean(WaterBodyProximity, na.rm = TRUE),
-            Precip = mean(TotalAnnualPrecipitation, na.rm = TRUE)) %>%
-  mutate(across(-ADMcode, scale))
+common_adm <- Reduce(intersect, list(detection_history$ADMcode, numcase_history$ADMcode, site_covs$ADMcode))
+detection_history <- detection_history %>% filter(ADMcode %in% common_adm)
+numcase_history <- numcase_history %>% filter(ADMcode %in% common_adm)
+site_covs <- site_covs %>% filter(ADMcode %in% common_adm)
+shp <- shp %>% filter(ADMcode %in% common_adm)
+
+num_years <- ncol(detection_history) - 1  # subtract ADMcode column
+obs_matrix <- as.matrix(numcase_history[, -1])
+obs_long <- as.vector(t(obs_matrix))  # stack row-wise
+
+stopifnot(nrow(site_covs) * num_years == length(obs_long))
 
 umf <- unmarkedFrameOccu(
-  y = detection_matrix,
+  y = as.matrix(detection_history[, -1]),
   siteCovs = site_covs %>% select(-ADMcode),
-  obsCovs = list(logCases = as.matrix(numcase_history[, -1]))
+  obsCovs = data.frame(logCases = obs_long)
 )
 
 fm_full <- occu(~ logCases ~ PopDensity + Insurance + Water + Precip, data = umf)
-fm_null <- occu(~ 1 ~ 1, data = umf)
-
-model_list <- fitList(full = fm_full, null = fm_null)
-print(modSel(model_list))
-
-print(summary(fm_full))
 
 pred_occ <- predict(fm_full, type = "state")
-shp$occ_prob <- pred_occ$Predicted
+pred_det <- predict(fm_full, type = "det")
 
-occ_map <- ggplot(shp) +
-  geom_sf(aes(fill = occ_prob), color = NA) +
-  scale_fill_viridis_c(option = "plasma", name = "Occupancy") +
+shp$occ_prob <- pred_occ$Predicted
+shp$det_prob <- pred_det$Predicted
+
+# Classify into high/low categories
+occ_thresh <- median(shp$occ_prob, na.rm = TRUE)
+det_thresh <- median(shp$det_prob, na.rm = TRUE)
+
+shp <- shp %>%
+  mutate(occ_class = ifelse(occ_prob >= occ_thresh, "HighOcc", "LowOcc"),
+         det_class = ifelse(det_prob >= det_thresh, "HighDet", "LowDet"),
+         bivar_class = paste0(occ_class, "_", det_class))
+
+# Choose bivariate color scale
+bivar_colors <- c("HighOcc_HighDet" = "#762a83",
+                  "HighOcc_LowDet" = "#af8dc3",
+                  "LowOcc_HighDet" = "#7fbf7b",
+                  "LowOcc_LowDet" = "#1b7837")
+
+# Plot bivariate map
+bivar_map <- ggplot(shp) +
+  geom_sf(aes(fill = bivar_class), color = NA) +
+  scale_fill_manual(values = bivar_colors, name = "Bivariate Class") +
   theme_classic() +
-  ggtitle("Predicted Occupancy from Full Model")
-print(occ_map)
+  ggtitle("Bivariate Map: Occupancy vs Detection")
+
+legend_plot <- bi_legend(pal = "GrPink", dim = 2, 
+                         xlab = "Higher Occupancy", 
+                         ylab = "Higher Detection", 
+                         size = 8)
+
+final_plot <- bivar_map + inset_element(legend_plot, left = 0.65, bottom = 0.1, right = 0.95, top = 0.4)
+
+print(final_plot)
